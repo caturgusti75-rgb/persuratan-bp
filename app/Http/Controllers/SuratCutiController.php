@@ -1,0 +1,233 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Asn;
+use App\Models\LogoSetting;
+use App\Models\SuratCuti;
+use Carbon\Carbon;
+use Carbon\CarbonInterface;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\View\View;
+
+class SuratCutiController extends Controller
+{
+    public function index(): View
+    {
+        $suratCutis = SuratCuti::with(['penandatangan', 'pegawai'])->latest()->paginate(5);
+
+        return view('surat_cutis.index', compact('suratCutis'));
+    }
+
+    public function create(): View
+    {
+        $asns = Asn::orderBy('nama')->get();
+
+        $defaultPenandatanganId = Asn::defaultPenandatanganId();
+
+        return view('surat_cutis.create', compact('asns', 'defaultPenandatanganId'));
+    }
+
+    public function store(Request $request): RedirectResponse
+    {
+        $validated = $request->validate([
+            'nomor_surat' => 'nullable|string|max:255',
+            'sifat_surat' => 'nullable|string|max:255',
+            'lampiran_surat' => 'nullable|string|max:255',
+            'perihal_surat' => 'nullable|string|max:255',
+            'jenis_cuti' => 'nullable|string|max:255',
+            'tujuan_surat' => 'nullable|string|max:255',
+            'tempat_ditetapkan' => 'nullable|string|max:255',
+            'tanggal_surat' => 'nullable|date',
+            'alasan_cuti' => 'nullable|string',
+            'tanggal_mulai_cuti' => 'nullable|date',
+            'tanggal_selesai_cuti' => 'nullable|date',
+            'pegawai_id' => 'nullable|exists:asns,id',
+            'penandatangan_id' => 'nullable|exists:asns,id',
+        ]);
+
+        $validated['jumlah_hari'] = $this->calculateLeaveDays(
+            $validated['tanggal_mulai_cuti'] ?? null,
+            $validated['tanggal_selesai_cuti'] ?? null
+        );
+
+        $suratCuti = SuratCuti::create($validated);
+
+        return redirect()->route('surat-cutis.print', $suratCuti)
+            ->with('success', 'Surat Cuti berhasil disimpan.');
+    }
+
+    public function edit(SuratCuti $suratCuti): View
+    {
+        $asns = Asn::orderBy('nama')->get();
+        $suratCuti->load('penandatangan', 'pegawai');
+
+        $defaultPenandatanganId = Asn::defaultPenandatanganId();
+
+        return view('surat_cutis.edit', compact('asns', 'suratCuti', 'defaultPenandatanganId'));
+    }
+
+    public function update(Request $request, SuratCuti $suratCuti): RedirectResponse
+    {
+        $validated = $request->validate([
+            'nomor_surat' => 'nullable|string|max:255',
+            'sifat_surat' => 'nullable|string|max:255',
+            'lampiran_surat' => 'nullable|string|max:255',
+            'perihal_surat' => 'nullable|string|max:255',
+            'jenis_cuti' => 'nullable|string|max:255',
+            'tujuan_surat' => 'nullable|string|max:255',
+            'tempat_ditetapkan' => 'nullable|string|max:255',
+            'tanggal_surat' => 'nullable|date',
+            'alasan_cuti' => 'nullable|string',
+            'tanggal_mulai_cuti' => 'nullable|date',
+            'tanggal_selesai_cuti' => 'nullable|date',
+            'pegawai_id' => 'nullable|exists:asns,id',
+            'penandatangan_id' => 'nullable|exists:asns,id',
+        ]);
+
+        $validated['jumlah_hari'] = $this->calculateLeaveDays(
+            $validated['tanggal_mulai_cuti'] ?? null,
+            $validated['tanggal_selesai_cuti'] ?? null
+        );
+
+        $suratCuti->update($validated);
+
+        return redirect()->route('surat-cutis.print', $suratCuti)
+            ->with('success', 'Surat Cuti berhasil diperbarui.');
+    }
+
+    public function destroy(SuratCuti $suratCuti): RedirectResponse
+    {
+        $suratCuti->delete();
+
+        return redirect()->route('surat-cutis.index')->with('success', 'Surat Cuti berhasil dihapus.');
+    }
+
+    public function print(SuratCuti $suratCuti): View
+    {
+        $suratCuti->load('penandatangan', 'pegawai');
+
+        $kopSuratBase64 = null;
+        $logo = LogoSetting::where('name', 'kop_smk')->first() ?? LogoSetting::latest()->first();
+        if ($logo && $logo->image) {
+            $kopSuratBase64 = 'data:'.($logo->mime ?: 'image/png').';base64,'.base64_encode($logo->image);
+        }
+
+        $leaveDurationText = $this->formatLeaveDuration($suratCuti);
+
+        return view('surat_cutis.print', compact('suratCuti', 'kopSuratBase64', 'leaveDurationText'));
+    }
+
+    private function formatLeaveDuration(SuratCuti $suratCuti): string
+    {
+        $mulai = $suratCuti->tanggal_mulai_cuti;
+        $selesai = $suratCuti->tanggal_selesai_cuti;
+
+        if (! $mulai || ! $selesai) {
+            return '';
+        }
+
+        $fmt = [self::class, 'formatTanggal'];
+        $days = $this->countWorkingDays($mulai, $selesai);
+        $daysTerbilang = $this->terbilangHari($days);
+
+        if ($mulai->isSameDay($selesai)) {
+            return 'selama '.$days.' ('.$daysTerbilang.') hari kerja, yaitu tanggal '.$fmt($mulai, '%d %B %Y');
+        }
+
+        return 'selama '.$days.' ('.$daysTerbilang.') hari kerja, yaitu tanggal '.$fmt($mulai, '%d %B %Y').' sampai dengan tanggal '.$fmt($selesai, '%d %B %Y');
+    }
+
+    private function countWorkingDays($mulai, $selesai): int
+    {
+        $start = Carbon::parse($mulai)->copy()->startOfDay();
+        $end = Carbon::parse($selesai)->copy()->startOfDay();
+
+        if ($end->lessThan($start)) {
+            [$start, $end] = [$end, $start];
+        }
+
+        $workingDays = 0;
+        $cursor = $start->copy();
+
+        while ($cursor->lessThanOrEqualTo($end)) {
+            $dayOfWeek = (int) $cursor->format('N');
+            if ($dayOfWeek !== 6 && $dayOfWeek !== 7) {
+                $workingDays++;
+            }
+            $cursor->addDay();
+        }
+
+        return $workingDays;
+    }
+
+    private function terbilangHari(int $n): string
+    {
+        $ones = [
+            0 => '', 1 => 'satu', 2 => 'dua', 3 => 'tiga', 4 => 'empat',
+            5 => 'lima', 6 => 'enam', 7 => 'tujuh', 8 => 'delapan', 9 => 'sembilan',
+            10 => 'sepuluh', 11 => 'sebelas',
+        ];
+
+        if ($n < 12) {
+            return $ones[$n];
+        }
+        if ($n < 20) {
+            return $ones[$n - 10].' belas';
+        }
+        if ($n < 100) {
+            $tens = intdiv($n, 10);
+            $unit = $n % 10;
+            $tensWord = [
+                2 => 'dua puluh', 3 => 'tiga puluh', 4 => 'empat puluh',
+                5 => 'lima puluh', 6 => 'enam puluh', 7 => 'tujuh puluh',
+                8 => 'delapan puluh', 9 => 'sembilan puluh',
+            ];
+
+            return $tensWord[$tens].($unit ? ' '.$ones[$unit] : '');
+        }
+
+        return (string) $n;
+    }
+
+    private function calculateLeaveDays($mulai, $selesai): int
+    {
+        if (! $mulai || ! $selesai) {
+            return 0;
+        }
+
+        $start = Carbon::parse($mulai);
+        $end = Carbon::parse($selesai);
+
+        return abs($start->diffInDays($end)) + 1;
+    }
+
+    public static function formatTanggal($date, string $format = '%d %B %Y'): string
+    {
+        if (empty($date)) {
+            return '-';
+        }
+
+        $carbon = $date instanceof CarbonInterface
+            ? $date
+            : Carbon::parse($date);
+
+        $months = [
+            1 => 'Januari', 2 => 'Februari', 3 => 'Maret', 4 => 'April',
+            5 => 'Mei', 6 => 'Juni', 7 => 'Juli', 8 => 'Agustus',
+            9 => 'September', 10 => 'Oktober', 11 => 'November', 12 => 'Desember',
+        ];
+
+        $out = $format;
+        $out = str_replace('%d', str_pad($carbon->format('d'), 2, '0', STR_PAD_LEFT), $out);
+        $out = str_replace('%m', $carbon->format('m'), $out);
+        $out = str_replace('%Y', $carbon->format('Y'), $out);
+
+        if (str_contains($format, '%B')) {
+            $out = str_replace('%B', $months[(int) $carbon->format('n')], $out);
+        }
+
+        return $out;
+    }
+}
